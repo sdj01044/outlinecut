@@ -1,0 +1,304 @@
+import streamlit as st
+import cv2
+import numpy as np
+from PIL import Image
+import io
+
+# ─────────────────────────────────────────
+#  페이지 설정
+# ─────────────────────────────────────────
+st.set_page_config(
+    page_title="EPS 외곽선 생성기",
+    page_icon="✂️",
+    layout="wide"
+)
+
+st.markdown("""
+<style>
+    .stApp { background-color: #f8f9fa; }
+    .block-container { padding-top: 2rem; }
+    h1 { color: #1a1a2e; font-size: 1.8rem; }
+    .stDownloadButton > button {
+        background-color: #0078D4;
+        color: white;
+        border: none;
+        border-radius: 8px;
+        width: 100%;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────
+#  헬퍼 함수
+# ─────────────────────────────────────────
+DPI = 96  # 화면 기준 DPI
+
+def mm_to_px(mm: float) -> int:
+    return max(1, int(round(mm * DPI / 25.4)))
+
+def hex_to_eps_rgb(hex_color: str):
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return r/255, g/255, b/255
+
+def extract_contours(gray: np.ndarray):
+    """
+    외곽선 추출:
+    RETR_CCOMP 계층 구조로 추출
+    - 레벨 0: 객체 외곽 테두리
+    - 레벨 1: 'ㅁ' 처럼 객체 안쪽 빈 공간(구멍)의 경계
+    두 레벨 모두 결과에 포함
+    """
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, binary = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY_INV)
+    kernel = np.ones((3, 3), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+    contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    if hierarchy is None:
+        return [], binary
+
+    result = [c for c in contours if cv2.contourArea(c) > 30]
+    return result, binary
+
+def dilate_contours(binary: np.ndarray, offset_mm: float):
+    """
+    칼선 추출 (실선):
+    - 외곽 칼선: 글자 바깥으로 offset mm 팽창
+    - 내부 칼선: 'ㅁ' 같은 구멍을 hole_mask로 분리 → 구멍 방향으로 offset mm 팽창
+    """
+    h, w = binary.shape
+    offset_px = mm_to_px(offset_mm)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (offset_px * 2 + 1, offset_px * 2 + 1))
+
+    # ① 외곽 칼선: binary 팽창 후 외부 컨투어만
+    dilated = cv2.dilate(binary, k, iterations=1)
+    outer_cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+    # ② 내부 칼선: 구멍 컨투어를 마스크에 채운 뒤 팽창
+    all_cnts, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    hole_mask = np.zeros((h, w), dtype=np.uint8)
+    if hierarchy is not None:
+        for i, cnt in enumerate(all_cnts):
+            # parent != -1 이면 구멍(hole) 컨투어
+            if hierarchy[0][i][3] != -1 and cv2.contourArea(cnt) > 30:
+                cv2.drawContours(hole_mask, [cnt], -1, 255, -1)
+
+    inner_cut_cnts = []
+    if hole_mask.any():
+        dilated_holes = cv2.dilate(hole_mask, k, iterations=1)
+        found, _ = cv2.findContours(dilated_holes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        inner_cut_cnts = [c for c in found if cv2.contourArea(c) > 30]
+
+    result = [c for c in outer_cnts if cv2.contourArea(c) > 50]
+    result.extend(inner_cut_cnts)
+    return result
+
+def contours_to_eps_paths(contours, img_h, scale_x, scale_y):
+    paths = []
+    for cnt in contours:
+        pts = cnt.reshape(-1, 2)
+        if len(pts) < 3:
+            continue
+        lines = [f"{pts[0][0]*scale_x:.3f} {(img_h - pts[0][1])*scale_y:.3f} moveto"]
+        for p in pts[1:]:
+            lines.append(f"{p[0]*scale_x:.3f} {(img_h - p[1])*scale_y:.3f} lineto")
+        lines.append("closepath")
+        paths.append("\n".join(lines))
+    return paths
+
+def generate_eps(img_bgr, use_outline, outline_mm, outline_color,
+                 use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color):
+    h, w = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    pts_w = w * 72 / DPI
+    pts_h = h * 72 / DPI
+    scale_x = pts_w / w
+    scale_y = pts_h / h
+
+    contours, binary = extract_contours(gray)
+
+    eps_lines = [
+        "%!PS-Adobe-3.0 EPSF-3.0",
+        f"%%BoundingBox: 0 0 {int(pts_w)} {int(pts_h)}",
+        f"%%HiResBoundingBox: 0.0 0.0 {pts_w:.4f} {pts_h:.4f}",
+        "%%Title: Outline Cut Path",
+        "%%Creator: EPS 외곽선 생성기",
+        "%%EndComments", "",
+    ]
+
+    if use_outline and contours:
+        r, g, b = hex_to_eps_rgb(outline_color)
+        stroke_pt = outline_mm * 72 / 25.4
+        paths = contours_to_eps_paths(contours, h, scale_x, scale_y)
+        eps_lines += [
+            "% ── 외곽선 (Outline) ──",
+            f"{r:.4f} {g:.4f} {b:.4f} setrgbcolor",
+            f"{stroke_pt:.4f} setlinewidth",
+            "1 setlinejoin", "1 setlinecap",
+        ]
+        for p in paths:
+            eps_lines += ["newpath", p, "stroke", ""]
+
+    if use_cutline and contours:
+        r, g, b = hex_to_eps_rgb(cutline_color)
+        stroke_pt = cutline_width_mm * 72 / 25.4
+        cut_contours = dilate_contours(binary, cutline_offset_mm)
+        if cut_contours:
+            paths = contours_to_eps_paths(cut_contours, h, scale_x, scale_y)
+            eps_lines += [
+                "% ── 칼선 (Cut Line) ──",
+                f"{r:.4f} {g:.4f} {b:.4f} setrgbcolor",
+                f"{stroke_pt:.4f} setlinewidth",
+                "1 setlinejoin", "1 setlinecap",
+            ]
+            for p in paths:
+                eps_lines += ["newpath", p, "stroke", ""]
+
+    eps_lines += ["", "%%EOF"]
+    return "\n".join(eps_lines).encode("utf-8")
+
+
+def hex_to_bgr(hex_color: str):
+    """#RRGGBB → OpenCV BGR 튜플"""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (b, g, r)
+
+def generate_preview_img(img_bgr, use_outline, outline_mm, outline_color,
+                         use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color):
+    """원본 이미지 위에 외곽선/칼선을 직접 그려 RGB numpy 배열로 반환"""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    contours, binary = extract_contours(gray)
+
+    # 원본 이미지를 살짝 밝게 해서 배경으로 사용
+    preview = img_bgr.copy()
+    # 흰 배경에 원본을 40% 투명도로 합성
+    white = np.ones_like(preview) * 255
+    preview = cv2.addWeighted(preview, 0.5, white, 0.5, 0)
+
+    if use_outline and contours:
+        color = hex_to_bgr(outline_color)
+        thickness = max(1, mm_to_px(outline_mm))
+        cv2.drawContours(preview, contours, -1, color, thickness)
+
+    if use_cutline and contours:
+        cut_contours = dilate_contours(binary, cutline_offset_mm)
+        color = hex_to_bgr(cutline_color)
+        thickness = max(1, mm_to_px(cutline_width_mm))
+        # 칼선: 실선으로 그리기
+        cv2.drawContours(preview, cut_contours, -1, color, thickness)
+
+    # BGR → RGB 변환 후 반환
+    return cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+
+
+# ─────────────────────────────────────────
+#  UI
+# ─────────────────────────────────────────
+st.title("✂️ EPS 외곽선 생성기")
+st.caption("이미지를 업로드하면 외곽선과 칼선을 자동 추출하여 EPS 파일로 변환합니다.")
+
+# ── 사이드바 ──
+with st.sidebar:
+    st.header("⚙️ 설정")
+    st.divider()
+
+    use_outline = st.toggle("🖊 외곽선 사용", value=True)
+    if use_outline:
+        outline_mm    = st.number_input("외곽선 두께 (mm)", 0.1, 10.0, 0.5, 0.1)
+        outline_color = st.color_picker("외곽선 색상", "#0078D4")
+    else:
+        outline_mm, outline_color = 0.5, "#0078D4"
+
+    st.divider()
+
+    use_cutline = st.toggle("✂️ 칼선 사용", value=True)
+    if use_cutline:
+        cutline_offset_mm = st.number_input("칼선 간격 (mm)", 0.1, 30.0, 3.0, 0.5)
+        cutline_width_mm  = st.number_input("칼선 두께 (mm)", 0.1, 5.0, 0.3, 0.1)
+        cutline_color     = st.color_picker("칼선 색상", "#FF0000")
+    else:
+        cutline_offset_mm, cutline_width_mm, cutline_color = 3.0, 0.3, "#FF0000"
+
+    if not use_outline and not use_cutline:
+        st.warning("⚠️ 외곽선 또는 칼선을 하나는 활성화해주세요.")
+
+# ── 메인 ──
+uploaded_files = st.file_uploader(
+    "이미지 업로드 (여러 개 선택 가능)",
+    type=["png", "jpg", "jpeg", "bmp", "tiff"],
+    accept_multiple_files=True,
+)
+
+if uploaded_files:
+    st.info(f"📁 {len(uploaded_files)}개 파일이 업로드되었습니다.")
+
+    can_start = use_outline or use_cutline
+    if st.button("🚀 처리 시작", type="primary", use_container_width=True, disabled=not can_start):
+        st.divider()
+        st.subheader("📋 처리 결과")
+
+        for idx, file in enumerate(uploaded_files):
+            st.markdown(f"**[{idx+1}/{len(uploaded_files)}] {file.name}**")
+            bar = st.progress(0, text="이미지 로딩 중...")
+
+            try:
+                # 이미지 로드
+                raw = np.frombuffer(file.read(), np.uint8)
+                img_bgr = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+                if img_bgr is None:
+                    st.error(f"❌ {file.name}: 이미지를 읽을 수 없습니다.")
+                    bar.empty()
+                    continue
+
+                bar.progress(25, text="벡터 패스 추출 중...")
+
+                # EPS 생성
+                eps_bytes = generate_eps(
+                    img_bgr,
+                    use_outline, outline_mm, outline_color,
+                    use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color
+                )
+                bar.progress(65, text="미리보기 생성 중...")
+
+                # PNG 미리보기 생성
+                preview_img = generate_preview_img(
+                    img_bgr,
+                    use_outline, outline_mm, outline_color,
+                    use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color
+                )
+                bar.progress(95, text="마무리 중...")
+
+                # 결과 출력
+                col1, col2 = st.columns([2, 1])
+                with col1:
+                    tab1, tab2 = st.tabs(["🖼 원본", "🔍 외곽선 미리보기"])
+                    with tab1:
+                        st.image(img_bgr[:, :, ::-1], use_container_width=True)
+                    with tab2:
+                        st.image(preview_img, use_container_width=True)
+
+                with col2:
+                    h_px, w_px = img_bgr.shape[:2]
+                    st.metric("가로", f"{w_px*25.4/DPI:.1f} mm")
+                    st.metric("세로", f"{h_px*25.4/DPI:.1f} mm")
+                    st.metric("EPS 크기", f"{len(eps_bytes)/1024:.1f} KB")
+                    eps_filename = file.name.rsplit(".", 1)[0] + ".eps"
+                    st.download_button(
+                        label="⬇️ EPS 다운로드",
+                        data=eps_bytes,
+                        file_name=eps_filename,
+                        mime="application/postscript",
+                        key=f"dl_{idx}",
+                        use_container_width=True,
+                    )
+
+                bar.progress(100, text=f"✅ 완료!")
+
+            except Exception as e:
+                st.error(f"❌ 오류: {str(e)}")
+                bar.empty()
+
+            st.divider()
