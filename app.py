@@ -9,7 +9,7 @@ import io
 # ─────────────────────────────────────────
 st.set_page_config(
     page_title="EPS 외곽선 생성기",
-    page_icon="✂️",
+    
     layout="wide"
 )
 
@@ -214,15 +214,18 @@ def generate_preview_img(img_bgr, use_outline, outline_mm, outline_color,
 # ─────────────────────────────────────────
 #  UI
 # ─────────────────────────────────────────
-st.title("✂️ EPS 외곽선 생성기")
+st.title("EPS 외곽선 생성기")
 st.caption("이미지를 업로드하면 외곽선과 칼선을 자동 추출하여 EPS 파일로 변환합니다.")
+
+# 파일 크기 제한 (MB)
+MAX_FILE_MB = 10
 
 # ── 사이드바 ──
 with st.sidebar:
-    st.header("⚙️ 설정")
+    st.header("설정")
     st.divider()
 
-    use_outline = st.checkbox("🖊 외곽선 사용", value=True)
+    use_outline = st.checkbox("외곽선 사용", value=True)
     if use_outline:
         outline_mm    = st.number_input("외곽선 두께 (mm)", 0.1, 10.0, 0.5, 0.1)
         outline_color = st.color_picker("외곽선 색상", "#0078D4")
@@ -231,7 +234,7 @@ with st.sidebar:
 
     st.divider()
 
-    use_cutline = st.checkbox("✂️ 칼선 사용", value=True)
+    use_cutline = st.checkbox("칼선 사용", value=True)
     if use_cutline:
         cutline_offset_mm = st.number_input("칼선 간격 (mm)", 0.1, 30.0, 3.0, 0.5)
         cutline_width_mm  = st.number_input("칼선 두께 (mm)", 0.1, 5.0, 0.3, 0.1)
@@ -240,7 +243,10 @@ with st.sidebar:
         cutline_offset_mm, cutline_width_mm, cutline_color = 3.0, 0.3, "#FF0000"
 
     if not use_outline and not use_cutline:
-        st.warning("⚠️ 외곽선 또는 칼선을 하나는 활성화해주세요.")
+        st.warning("외곽선 또는 칼선을 하나는 활성화해주세요.")
+
+    st.divider()
+    st.caption(f"파일 1개당 최대 {MAX_FILE_MB}MB")
 
 # ── 메인 ──
 uploaded_files = st.file_uploader(
@@ -250,73 +256,95 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    st.info(f"📁 {len(uploaded_files)}개 파일이 업로드되었습니다.")
+    # 파일 크기 검사
+    oversized = []
+    valid_files = []
+    for f in uploaded_files:
+        f.seek(0, 2)              # 파일 끝으로 이동
+        size_mb = f.tell() / (1024 * 1024)
+        f.seek(0)                 # 포인터 초기화
+        if size_mb > MAX_FILE_MB:
+            oversized.append((f.name, size_mb))
+        else:
+            valid_files.append(f)
 
-    can_start = use_outline or use_cutline
-    if st.button("🚀 처리 시작", type="primary", use_container_width=True, disabled=not can_start):
-        st.divider()
-        st.subheader("📋 처리 결과")
+    # 초과 파일 경고
+    if oversized:
+        for name, size_mb in oversized:
+            st.error(
+                f"파일 크기 초과: {name} ({size_mb:.1f}MB) — "
+                f"최대 허용 크기는 {MAX_FILE_MB}MB입니다. 해당 파일은 처리에서 제외됩니다."
+            )
 
-        for idx, file in enumerate(uploaded_files):
-            st.markdown(f"**[{idx+1}/{len(uploaded_files)}] {file.name}**")
-            bar = st.progress(0, text="이미지 로딩 중...")
+    if valid_files:
+        st.info(f"{len(valid_files)}개 파일 준비 완료" +
+                (f" ({len(oversized)}개 제외됨)" if oversized else ""))
 
-            try:
-                # 이미지 로드 (파일 포인터를 처음으로 되돌린 후 읽기)
-                file.seek(0)
-                raw = np.frombuffer(file.read(), np.uint8)
-                img_bgr = cv2.imdecode(raw, cv2.IMREAD_COLOR)
-                if img_bgr is None:
-                    st.error(f"❌ {file.name}: 이미지를 읽을 수 없습니다.")
-                    bar.empty()
-                    continue
-
-                bar.progress(25, text="벡터 패스 추출 중...")
-
-                # EPS 생성
-                eps_bytes = generate_eps(
-                    img_bgr,
-                    use_outline, outline_mm, outline_color,
-                    use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color
-                )
-                bar.progress(65, text="미리보기 생성 중...")
-
-                # PNG 미리보기 생성
-                preview_img = generate_preview_img(
-                    img_bgr,
-                    use_outline, outline_mm, outline_color,
-                    use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color
-                )
-                bar.progress(95, text="마무리 중...")
-
-                # 결과 출력
-                col1, col2 = st.columns([2, 1])
-                with col1:
-                    tab1, tab2 = st.tabs(["🖼 원본", "🔍 외곽선 미리보기"])
-                    with tab1:
-                        st.image(img_bgr[:, :, ::-1], use_container_width=True)
-                    with tab2:
-                        st.image(preview_img, use_container_width=True)
-
-                with col2:
-                    h_px, w_px = img_bgr.shape[:2]
-                    st.metric("가로", f"{w_px*25.4/DPI:.1f} mm")
-                    st.metric("세로", f"{h_px*25.4/DPI:.1f} mm")
-                    st.metric("EPS 크기", f"{len(eps_bytes)/1024:.1f} KB")
-                    eps_filename = file.name.rsplit(".", 1)[0] + ".eps"
-                    st.download_button(
-                        label="⬇️ EPS 다운로드",
-                        data=eps_bytes,
-                        file_name=eps_filename,
-                        mime="application/postscript",
-                        key=f"dl_{idx}",
-                        use_container_width=True,
-                    )
-
-                bar.progress(100, text=f"✅ 완료!")
-
-            except Exception as e:
-                st.error(f"❌ 오류: {str(e)}")
-                bar.empty()
-
+        can_start = use_outline or use_cutline
+        if st.button("처리 시작", type="primary", use_container_width=True, disabled=not can_start):
             st.divider()
+            st.subheader("처리 결과")
+
+            for idx, file in enumerate(valid_files):
+                st.markdown(f"**[{idx+1}/{len(valid_files)}] {file.name}**")
+                bar = st.progress(0, text="이미지 로딩 중...")
+
+                try:
+                    # 이미지 로드 (포인터 초기화 후 읽기)
+                    file.seek(0)
+                    raw = np.frombuffer(file.read(), np.uint8)
+                    img_bgr = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+                    if img_bgr is None:
+                        st.error(f"{file.name}: 이미지를 읽을 수 없습니다.")
+                        bar.empty()
+                        continue
+
+                    bar.progress(25, text="벡터 패스 추출 중...")
+
+                    # EPS 생성
+                    eps_bytes = generate_eps(
+                        img_bgr,
+                        use_outline, outline_mm, outline_color,
+                        use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color
+                    )
+                    bar.progress(65, text="미리보기 생성 중...")
+
+                    # 미리보기 이미지 생성
+                    preview_img = generate_preview_img(
+                        img_bgr,
+                        use_outline, outline_mm, outline_color,
+                        use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color
+                    )
+                    bar.progress(95, text="마무리 중...")
+
+                    # 결과 출력
+                    col1, col2 = st.columns([2, 1])
+                    with col1:
+                        tab1, tab2 = st.tabs(["원본", "외곽선 미리보기"])
+                        with tab1:
+                            st.image(img_bgr[:, :, ::-1], use_container_width=True)
+                        with tab2:
+                            st.image(preview_img, use_container_width=True)
+
+                    with col2:
+                        h_px, w_px = img_bgr.shape[:2]
+                        st.metric("가로", f"{w_px*25.4/DPI:.1f} mm")
+                        st.metric("세로", f"{h_px*25.4/DPI:.1f} mm")
+                        st.metric("EPS 크기", f"{len(eps_bytes)/1024:.1f} KB")
+                        eps_filename = file.name.rsplit(".", 1)[0] + ".eps"
+                        st.download_button(
+                            label="EPS 다운로드",
+                            data=eps_bytes,
+                            file_name=eps_filename,
+                            mime="application/postscript",
+                            key=f"dl_{idx}",
+                            use_container_width=True,
+                        )
+
+                    bar.progress(100, text="완료!")
+
+                except Exception as e:
+                    st.error(f"오류 발생 ({file.name}): {str(e)}")
+                    bar.empty()
+
+                st.divider()
