@@ -34,6 +34,42 @@ st.markdown("""
 # ─────────────────────────────────────────
 DPI = 96  # 화면 기준 DPI
 
+# ── 베지어 곡선 스무딩 ──
+def catmull_to_bezier(p0, p1, p2, p3, tension=0.4):
+    """Catmull-Rom 제어점 → Cubic Bezier 제어점 변환"""
+    cp1 = p1 + tension * (p2 - p0) / 2
+    cp2 = p2 - tension * (p3 - p1) / 2
+    return cp1, cp2
+
+def simplify_contour(cnt, smoothing: float = 5.0):
+    """
+    일러스트 Simplify와 동일한 방식:
+    1. approxPolyDP로 포인트 수 대폭 감소
+    2. Catmull-Rom 기반 Cubic Bezier로 부드럽게 연결
+    smoothing: 1=세밀, 5=보통(기본), 10=많이 단순화
+    """
+    epsilon = smoothing * cv2.arcLength(cnt, True) / 1000
+    approx = cv2.approxPolyDP(cnt, epsilon, True)
+    return approx.reshape(-1, 2).astype(float)
+
+def pts_to_eps_bezier(pts, img_h, sx=1.0, sy=1.0):
+    """스무딩된 포인트 → EPS cubic bezier 패스"""
+    n = len(pts)
+    if n < 3:
+        return ""
+    lines = [f"{pts[0][0]*sx:.3f} {(img_h - pts[0][1])*sy:.3f} moveto"]
+    for i in range(n):
+        p0 = pts[(i-1) % n]; p1 = pts[i]
+        p2 = pts[(i+1) % n]; p3 = pts[(i+2) % n]
+        cp1, cp2 = catmull_to_bezier(p0, p1, p2, p3)
+        lines.append(
+            f"{cp1[0]*sx:.3f} {(img_h-cp1[1])*sy:.3f} "
+            f"{cp2[0]*sx:.3f} {(img_h-cp2[1])*sy:.3f} "
+            f"{p2[0]*sx:.3f} {(img_h-p2[1])*sy:.3f} curveto"
+        )
+    lines.append("closepath")
+    return "\n".join(lines)
+
 def mm_to_px(mm: float) -> int:
     return max(1, int(round(mm * DPI / 25.4)))
 
@@ -44,22 +80,35 @@ def hex_to_eps_rgb(hex_color: str):
 
 def extract_contours(gray: np.ndarray):
     """
-    외곽선 추출:
-    RETR_CCOMP 계층 구조로 추출
-    - 레벨 0: 객체 외곽 테두리
-    - 레벨 1: 'ㅁ' 처럼 객체 안쪽 빈 공간(구멍)의 경계
-    두 레벨 모두 결과에 포함
+    스마트 외곽선 추출:
+    1. 밝은 배경(흰색 등)을 제거해 전경 마스크 생성
+    2. 모폴로지로 라벨/내부 디테일을 메워서 실루엣 하나로 통합
+    3. 전체 면적의 5% 이상인 주요 컨투어만 반환
+       → 병·글자처럼 배경과 분리된 객체의 외곽만 깔끔하게 추출
     """
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, binary = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY_INV)
-    kernel = np.ones((3, 3), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    h, w = gray.shape
 
-    contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
-    if hierarchy is None:
-        return [], binary
+    # ① 밝은 배경 제거 (임계값 240: 흰색/아이보리 배경 대응)
+    _, bg_mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+    fg_mask = cv2.bitwise_not(bg_mask)
 
-    result = [c for c in contours if cv2.contourArea(c) > 30]
+    # ② 내부 구멍 메우기 → 라벨·디테일이 뭉쳐서 실루엣 하나가 됨
+    k_close = np.ones((20, 20), np.uint8)
+    fg_filled = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, k_close)
+
+    # ③ 작은 노이즈 제거
+    k_open = np.ones((5, 5), np.uint8)
+    binary = cv2.morphologyEx(fg_filled, cv2.MORPH_OPEN, k_open)
+
+    # ④ 외부 컨투어만 추출, 면적 5% 이상만 유효
+    cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    min_area = h * w * 0.05
+    result = [c for c in cnts if cv2.contourArea(c) >= min_area]
+
+    # 면적 기준 없어도 최소 가장 큰 것 하나는 반환
+    if not result and cnts:
+        result = [max(cnts, key=cv2.contourArea)]
+
     return result, binary
 
 def dilate_contours(binary: np.ndarray, offset_mm: float):
@@ -112,21 +161,21 @@ def dilate_contours(binary: np.ndarray, offset_mm: float):
     result.extend(inner_cut_cnts)
     return result
 
-def contours_to_eps_paths(contours, img_h, scale_x, scale_y):
+def contours_to_eps_paths(contours, img_h, scale_x, scale_y, smoothing=5.0):
+    """컨투어 → 스무딩된 Cubic Bezier EPS 패스 리스트"""
     paths = []
     for cnt in contours:
-        pts = cnt.reshape(-1, 2)
+        pts = simplify_contour(cnt, smoothing)
         if len(pts) < 3:
             continue
-        lines = [f"{pts[0][0]*scale_x:.3f} {(img_h - pts[0][1])*scale_y:.3f} moveto"]
-        for p in pts[1:]:
-            lines.append(f"{p[0]*scale_x:.3f} {(img_h - p[1])*scale_y:.3f} lineto")
-        lines.append("closepath")
-        paths.append("\n".join(lines))
+        path = pts_to_eps_bezier(pts, img_h, scale_x, scale_y)
+        if path:
+            paths.append(path)
     return paths
 
 def generate_eps(img_bgr, use_outline, outline_mm, outline_color,
-                 use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color):
+                 use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
+                 smoothing=5.0):
     h, w = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     pts_w = w * 72 / DPI
@@ -148,7 +197,7 @@ def generate_eps(img_bgr, use_outline, outline_mm, outline_color,
     if use_outline and contours:
         r, g, b = hex_to_eps_rgb(outline_color)
         stroke_pt = outline_mm * 72 / 25.4
-        paths = contours_to_eps_paths(contours, h, scale_x, scale_y)
+        paths = contours_to_eps_paths(contours, h, scale_x, scale_y, smoothing)
         eps_lines += [
             "% ── 외곽선 (Outline) ──",
             f"{r:.4f} {g:.4f} {b:.4f} setrgbcolor",
@@ -163,7 +212,7 @@ def generate_eps(img_bgr, use_outline, outline_mm, outline_color,
         stroke_pt = cutline_width_mm * 72 / 25.4
         cut_contours = dilate_contours(binary, cutline_offset_mm)
         if cut_contours:
-            paths = contours_to_eps_paths(cut_contours, h, scale_x, scale_y)
+            paths = contours_to_eps_paths(cut_contours, h, scale_x, scale_y, smoothing)
             eps_lines += [
                 "% ── 칼선 (Cut Line) ──",
                 f"{r:.4f} {g:.4f} {b:.4f} setrgbcolor",
@@ -184,7 +233,8 @@ def hex_to_bgr(hex_color: str):
     return (b, g, r)
 
 def generate_preview_img(img_bgr, use_outline, outline_mm, outline_color,
-                         use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color):
+                         use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
+                         smoothing=5.0):
     """원본 이미지 위에 외곽선/칼선을 직접 그려 RGB numpy 배열로 반환"""
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     contours, binary = extract_contours(gray)
@@ -198,14 +248,17 @@ def generate_preview_img(img_bgr, use_outline, outline_mm, outline_color,
     if use_outline and contours:
         color = hex_to_bgr(outline_color)
         thickness = max(1, mm_to_px(outline_mm))
-        cv2.drawContours(preview, contours, -1, color, thickness)
+        for cnt in contours:
+            pts = simplify_contour(cnt, smoothing).astype(np.int32)
+            cv2.polylines(preview, [pts], True, color, thickness, cv2.LINE_AA)
 
     if use_cutline and contours:
         cut_contours = dilate_contours(binary, cutline_offset_mm)
         color = hex_to_bgr(cutline_color)
         thickness = max(1, mm_to_px(cutline_width_mm))
-        # 칼선: 실선으로 그리기
-        cv2.drawContours(preview, cut_contours, -1, color, thickness)
+        for cnt in cut_contours:
+            pts = simplify_contour(cnt, smoothing).astype(np.int32)
+            cv2.polylines(preview, [pts], True, color, thickness, cv2.LINE_AA)
 
     # BGR → RGB 변환 후 반환
     return cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
@@ -246,6 +299,12 @@ with col_cutline:
 
 if not use_outline and not use_cutline:
     st.warning("외곽선 또는 칼선을 하나는 활성화해주세요.")
+
+st.markdown("**선 단순화 (Simplify)**")
+smoothing = st.slider(
+    "단순화 강도 — 값이 클수록 더 단순하고 매끄러운 선",
+    min_value=1, max_value=15, value=5, step=1
+)
 
 st.divider()
 
@@ -306,7 +365,8 @@ if uploaded_files:
                     eps_bytes = generate_eps(
                         img_bgr,
                         use_outline, outline_mm, outline_color,
-                        use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color
+                        use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
+                        smoothing=smoothing
                     )
                     bar.progress(65, text="미리보기 생성 중...")
 
@@ -314,7 +374,8 @@ if uploaded_files:
                     preview_img = generate_preview_img(
                         img_bgr,
                         use_outline, outline_mm, outline_color,
-                        use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color
+                        use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
+                        smoothing=smoothing
                     )
                     bar.progress(95, text="마무리 중...")
 
