@@ -68,18 +68,17 @@ def hex_to_eps_rgb(hex_color: str):
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return r/255, g/255, b/255
 
-def extract_contours(gray: np.ndarray):
+def extract_contours(gray: np.ndarray, gap_fill: int = -1):
     """
-    자동 스마트 외곽선 추출:
-    RETR_CCOMP로 외곽·구멍 모두 추출 후
-    "가장 큰 구멍 / 가장 큰 외곽" 비율로 객체 유형 자동 판별.
-
-    비율 > 20%  → 흰 몸통이 구멍으로 잡힌 외곽선 객체 (고양이·스티커 등)
-                   gap_fill 자동 계산 후 실루엣 하나로 병합
-    비율 ≤ 20%  → 획으로 이뤄진 객체 (글자·어두운 객체 등)
-                   내부 구멍(ㅁ) 포함 그대로 유지
+    스마트 외곽선 추출.
+    gap_fill = -1 (기본): 자동 판별
+        - 최대 구멍/최대 외곽 비율 > 20% → 흰 몸통 객체(고양이 등) → 자동 gap_fill
+        - 비율 ≤ 20% → 획/글자/일반 객체 → 내부 구멍 3% 이상만 포함
+    gap_fill = 0  : 내부 채우기 없음 (글자·세밀한 객체)
+    gap_fill > 0  : 수동으로 지정한 px만큼 내부 채우기 (라임·복잡한 객체)
     """
     h, w = gray.shape
+    min_outer_area = h * w * 0.01
 
     # ① 밝은 배경 제거 + 노이즈 제거
     _, bg_mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
@@ -91,38 +90,48 @@ def extract_contours(gray: np.ndarray):
     if hier is None or len(cnts) == 0:
         return [], fg
 
-    min_area = h * w * 0.001
-
     outer_areas = [cv2.contourArea(cnts[i]) for i in range(len(cnts)) if hier[0][i][3] == -1]
     hole_areas  = [cv2.contourArea(cnts[i]) for i in range(len(cnts)) if hier[0][i][3] != -1]
-
     max_outer = max(outer_areas) if outer_areas else 1
     max_hole  = max(hole_areas)  if hole_areas  else 0
-    largest_hole_ratio = max_hole / max_outer
 
-    if largest_hole_ratio > 0.20:
-        # 흰 몸통이 구멍으로 잡힌 경우 → gap_fill로 실루엣 통합
-        outer_cnts = [cnts[i] for i in range(len(cnts))
-                      if hier[0][i][3] == -1 and cv2.contourArea(cnts[i]) >= h * w * 0.01]
-        if not outer_cnts:
-            return [max(cnts, key=cv2.contourArea)], fg
+    # ③ gap_fill 값 결정
+    if gap_fill == -1:
+        # 자동 판별
+        largest_hole_ratio = max_hole / max_outer
+        if largest_hole_ratio > 0.20:
+            outer_cnts = [cnts[i] for i in range(len(cnts))
+                          if hier[0][i][3] == -1 and cv2.contourArea(cnts[i]) >= min_outer_area]
+            largest = max(outer_cnts, key=cv2.contourArea) if outer_cnts else max(cnts, key=cv2.contourArea)
+            _, _, bw, bh = cv2.boundingRect(largest)
+            gap_fill = max(10, min(bw, bh) // 8)
+        else:
+            gap_fill = 0
 
-        largest = max(outer_cnts, key=cv2.contourArea)
-        _, _, bw, bh = cv2.boundingRect(largest)
-        gap_fill = max(10, min(bw, bh) // 8)
+    # ④ gap_fill 적용
+    if gap_fill > 0:
         k = np.ones((gap_fill, gap_fill), np.uint8)
         filled = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k)
         binary = cv2.morphologyEx(filled, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         result_cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        result = [c for c in result_cnts if cv2.contourArea(c) >= h * w * 0.01]
+        result = [c for c in result_cnts if cv2.contourArea(c) >= min_outer_area]
     else:
-        # 획/글자 객체 → 내부 구멍 포함
-        binary = fg
-        result = [c for c in cnts if cv2.contourArea(c) >= min_area]
+        # gap_fill=0: 외곽 전부 + 구멍은 최대 외곽의 3% 이상만
+        HOLE_MIN_RATIO = 0.03
+        result = []
+        for i, cnt in enumerate(cnts):
+            area = cv2.contourArea(cnt)
+            is_hole = hier[0][i][3] != -1
+            if is_hole:
+                if area / max_outer >= HOLE_MIN_RATIO:
+                    result.append(cnt)
+            else:
+                if area >= h * w * 0.001:
+                    result.append(cnt)
 
     if not result and cnts:
         result = [max(cnts, key=cv2.contourArea)]
-    return result, binary
+    return result, fg
 
 def dilate_contours(binary: np.ndarray, offset_mm: float):
     """
@@ -188,7 +197,7 @@ def contours_to_eps_paths(contours, img_h, scale_x, scale_y, smoothing=2.0):
 
 def generate_eps(img_bgr, use_outline, outline_mm, outline_color,
                  use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
-                 smoothing=2.0):
+                 smoothing=2.0, gap_fill=-1):
     h, w = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     pts_w = w * 72 / DPI
@@ -196,7 +205,7 @@ def generate_eps(img_bgr, use_outline, outline_mm, outline_color,
     scale_x = pts_w / w
     scale_y = pts_h / h
 
-    contours, binary = extract_contours(gray)
+    contours, binary = extract_contours(gray, gap_fill=gap_fill)
 
     eps_lines = [
         "%!PS-Adobe-3.0 EPSF-3.0",
@@ -247,10 +256,10 @@ def hex_to_bgr(hex_color: str):
 
 def generate_preview_img(img_bgr, use_outline, outline_mm, outline_color,
                          use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
-                         smoothing=2.0):
+                         smoothing=2.0, gap_fill=-1):
     """원본 이미지 위에 외곽선/칼선을 직접 그려 RGB numpy 배열로 반환"""
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    contours, binary = extract_contours(gray)
+    contours, binary = extract_contours(gray, gap_fill=gap_fill)
 
     # 원본 이미지를 살짝 밝게 해서 배경으로 사용
     preview = img_bgr.copy()
@@ -314,9 +323,51 @@ if not use_outline and not use_cutline:
     st.warning("외곽선 또는 칼선을 하나는 활성화해주세요.")
 
 st.markdown("**선 스무딩**")
+st.markdown("""
+<table style="width:100%; font-size:0.8rem; border-collapse:collapse; margin-bottom:4px;">
+  <tr style="background:#f0f2f6;">
+    <td style="padding:6px 10px; width:33%; text-align:center; border-radius:6px 0 0 6px;">
+      <b>1 (최소)</b><br>
+      <span style="color:#555;">원본에 가장 가까운 형태<br>픽셀 노이즈만 제거<br>글자·세밀한 객체 추천</span>
+    </td>
+    <td style="padding:6px 10px; width:33%; text-align:center; border:1px solid #ddd;">
+      <b>3~5 (중간)</b><br>
+      <span style="color:#555;">자연스럽게 부드러운 선<br>대부분의 이미지에 적합<br>기본 권장값</span>
+    </td>
+    <td style="padding:6px 10px; width:33%; text-align:center; border-radius:0 6px 6px 0; background:#fff3cd;">
+      <b>8~10 (최대)</b><br>
+      <span style="color:#555;">모서리가 둥글게 처리<br>단순한 실루엣 객체에 적합<br>글자에는 형태 손실 발생</span>
+    </td>
+  </tr>
+</table>
+""", unsafe_allow_html=True)
 smoothing = st.slider(
-    "스무딩 강도 — 형태 유지하며 선을 부드럽게 (1=약하게, 6=많이)",
+    "스무딩 강도",
     min_value=1, max_value=10, value=2, step=1
+)
+
+st.markdown("**내부 채우기**")
+st.markdown("""
+<table style="width:100%; font-size:0.8rem; border-collapse:collapse; margin-bottom:4px;">
+  <tr style="background:#f0f2f6;">
+    <td style="padding:6px 10px; width:33%; text-align:center; border-radius:6px 0 0 6px;">
+      <b>-1 (자동)</b><br>
+      <span style="color:#555;">이미지 유형 자동 판별<br>고양이·스티커: 채우기 적용<br>글자·단색 객체: 채우기 없음</span>
+    </td>
+    <td style="padding:6px 10px; width:33%; text-align:center; border:1px solid #ddd;">
+      <b>0 (끔)</b><br>
+      <span style="color:#555;">내부 채우기 완전히 없음<br>글자·한자처럼 획이 객체인 경우<br>내부 구멍(ㅁ)도 선이 생김</span>
+    </td>
+    <td style="padding:6px 10px; width:33%; text-align:center; border-radius:0 6px 6px 0; background:#fff3cd;">
+      <b>10~30 (수동)</b><br>
+      <span style="color:#555;">내부 디테일을 메워 외곽만 남김<br>라임처럼 내부 선이 생기는 경우<br>병·복잡한 배경 이미지에 적합</span>
+    </td>
+  </tr>
+</table>
+""", unsafe_allow_html=True)
+gap_fill = st.slider(
+    "내부 채우기 강도",
+    min_value=-1, max_value=30, value=-1, step=1
 )
 
 st.divider()
@@ -380,7 +431,7 @@ if uploaded_files:
                         img_bgr,
                         use_outline, outline_mm, outline_color,
                         use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
-                        smoothing=smoothing
+                        smoothing=smoothing, gap_fill=gap_fill
                     )
                     bar.progress(65, text="미리보기 생성 중...")
 
@@ -389,7 +440,7 @@ if uploaded_files:
                         img_bgr,
                         use_outline, outline_mm, outline_color,
                         use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
-                        smoothing=smoothing
+                        smoothing=smoothing, gap_fill=gap_fill
                     )
                     bar.progress(95, text="마무리 중...")
 
