@@ -113,8 +113,11 @@ def extract_contours(gray: np.ndarray, gap_fill: int = -1):
         k = np.ones((gap_fill, gap_fill), np.uint8)
         filled = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k)
         binary = cv2.morphologyEx(filled, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        # RETR_EXTERNAL: 내부 구멍 완전 무시 → 고양이 몸통 내부 선 방지
         result_cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         result = [c for c in result_cnts if cv2.contourArea(c) >= min_outer_area]
+        # gap_fill 적용 시 내부 칼선 방지를 위해 binary를 채워진 상태로 반환
+        return result, binary
     else:
         # gap_fill=0: 외곽 전부 + 구멍은 최대 외곽의 3% 이상만
         HOLE_MIN_RATIO = 0.03
@@ -313,62 +316,81 @@ with col_cutline:
     st.markdown("**칼선**")
     use_cutline = st.checkbox("칼선 사용", value=True)
     if use_cutline:
-        cutline_offset_mm = st.number_input("칼선 간격 (mm)", 0.1, 30.0, 3.0, 0.5)
+        cutline_offset_mm = st.number_input("칼선 간격 (mm)", 0.1, 30.0, 2.0, 0.5)
         cutline_width_mm  = st.number_input("칼선 두께 (mm)", 0.1, 5.0, 0.3, 0.1)
         cutline_color     = st.color_picker("칼선 색상", "#FF0000")
     else:
-        cutline_offset_mm, cutline_width_mm, cutline_color = 3.0, 0.3, "#FF0000"
+        cutline_offset_mm, cutline_width_mm, cutline_color = 2.0, 0.3, "#FF0000"
 
 if not use_outline and not use_cutline:
     st.warning("외곽선 또는 칼선을 하나는 활성화해주세요.")
 
 st.markdown("**선 스무딩**")
 st.markdown("""
-<table style="width:100%; font-size:0.8rem; border-collapse:collapse; margin-bottom:4px;">
-  <tr style="background:#f0f2f6;">
-    <td style="padding:6px 10px; width:33%; text-align:center; border-radius:6px 0 0 6px;">
-      <b>1 (최소)</b><br>
-      <span style="color:#555;">원본에 가장 가까운 형태<br>픽셀 노이즈만 제거<br>글자·세밀한 객체 추천</span>
+<table style="width:100%; font-size:0.8rem; border-collapse:collapse; margin-bottom:6px;">
+  <tr>
+    <td style="padding:8px 12px; width:33%; text-align:center; background:#f0f2f6; border-radius:6px 0 0 6px; border:1px solid #ddd;">
+      <b>약하게</b><br>
+      <span style="color:#555;">원본 형태 그대로 유지<br>픽셀 노이즈만 제거<br>글자·세밀한 객체 추천</span>
     </td>
-    <td style="padding:6px 10px; width:33%; text-align:center; border:1px solid #ddd;">
-      <b>3~5 (중간)</b><br>
+    <td style="padding:8px 12px; width:33%; text-align:center; background:#e8f4fd; border:1px solid #90caf9;">
+      <b>보통 (기본)</b><br>
       <span style="color:#555;">자연스럽게 부드러운 선<br>대부분의 이미지에 적합<br>기본 권장값</span>
     </td>
-    <td style="padding:6px 10px; width:33%; text-align:center; border-radius:0 6px 6px 0; background:#fff3cd;">
-      <b>8~10 (최대)</b><br>
-      <span style="color:#555;">모서리가 둥글게 처리<br>단순한 실루엣 객체에 적합<br>글자에는 형태 손실 발생</span>
+    <td style="padding:8px 12px; width:33%; text-align:center; background:#fff3cd; border-radius:0 6px 6px 0; border:1px solid #ffc107;">
+      <b>많이</b><br>
+      <span style="color:#555;">모서리가 둥글게 처리됨<br>단순한 실루엣에 적합<br>글자는 형태 손실 주의</span>
     </td>
   </tr>
 </table>
 """, unsafe_allow_html=True)
-smoothing = st.slider(
+smoothing = st.select_slider(
     "스무딩 강도",
-    min_value=1, max_value=10, value=2, step=1
+    options=["약하게", "보통", "많이"],
+    value="보통"
 )
+smoothing_val = {"약하게": 1, "보통": 4, "많이": 8}[smoothing]
 
 st.markdown("**내부 채우기**")
-st.markdown("""
-<table style="width:100%; font-size:0.8rem; border-collapse:collapse; margin-bottom:4px;">
-  <tr style="background:#f0f2f6;">
-    <td style="padding:6px 10px; width:33%; text-align:center; border-radius:6px 0 0 6px;">
-      <b>-1 (자동)</b><br>
-      <span style="color:#555;">이미지 유형 자동 판별<br>고양이·스티커: 채우기 적용<br>글자·단색 객체: 채우기 없음</span>
+# 자동 체크박스
+gap_fill_auto = st.checkbox("내부 채우기 자동 판별", value=True,
+    help="이미지 유형을 분석해 고양이·스티커는 채우기 적용, 글자·단색 객체는 채우기 없음으로 자동 결정합니다.")
+
+if gap_fill_auto:
+    # 자동 선택 시 안내만 표시
+    st.markdown("""
+<div style="padding:8px 14px; background:#e8f4fd; border-left:4px solid #0078D4;
+            border-radius:4px; font-size:0.85rem; color:#333; margin-bottom:8px;">
+  이미지 유형 자동 판별 중 — 고양이·스티커는 채우기 적용 /
+  글자·한자·단색 객체는 채우기 없음
+</div>
+""", unsafe_allow_html=True)
+    gap_fill = -1
+else:
+    st.markdown("""
+<table style="width:100%; font-size:0.8rem; border-collapse:collapse; margin-bottom:6px;">
+  <tr>
+    <td style="padding:8px 12px; width:33%; text-align:center; background:#f0f2f6; border-radius:6px 0 0 6px; border:1px solid #ddd;">
+      <b>끔</b><br>
+      <span style="color:#555;">내부 채우기 사용 안 함<br>글자·한자처럼 획이 객체이고<br>내부 구멍(ㅁ)에도 선이 필요할 때</span>
     </td>
-    <td style="padding:6px 10px; width:33%; text-align:center; border:1px solid #ddd;">
-      <b>0 (끔)</b><br>
-      <span style="color:#555;">내부 채우기 완전히 없음<br>글자·한자처럼 획이 객체인 경우<br>내부 구멍(ㅁ)도 선이 생김</span>
+    <td style="padding:8px 12px; width:33%; text-align:center; background:#e8f4fd; border:1px solid #90caf9;">
+      <b>중간 (기본)</b><br>
+      <span style="color:#555;">내부 디테일 일부 메움<br>자동 판별이 애매한 경우<br>라임 등 중간 복잡도 이미지</span>
     </td>
-    <td style="padding:6px 10px; width:33%; text-align:center; border-radius:0 6px 6px 0; background:#fff3cd;">
-      <b>10~30 (수동)</b><br>
-      <span style="color:#555;">내부 디테일을 메워 외곽만 남김<br>라임처럼 내부 선이 생기는 경우<br>병·복잡한 배경 이미지에 적합</span>
+    <td style="padding:8px 12px; width:33%; text-align:center; background:#fff3cd; border-radius:0 6px 6px 0; border:1px solid #ffc107;">
+      <b>최대</b><br>
+      <span style="color:#555;">내부 디테일 모두 메워 외곽만<br>병·라임처럼 내부에 선이<br>불필요하게 생기는 경우</span>
     </td>
   </tr>
 </table>
 """, unsafe_allow_html=True)
-gap_fill = st.slider(
-    "내부 채우기 강도",
-    min_value=-1, max_value=30, value=-1, step=1
-)
+    gap_fill_sel = st.select_slider(
+        "내부 채우기 강도",
+        options=["끔", "중간", "최대"],
+        value="중간"
+    )
+    gap_fill = {"끔": 0, "중간": 15, "최대": 30}[gap_fill_sel]
 
 st.divider()
 
@@ -431,7 +453,7 @@ if uploaded_files:
                         img_bgr,
                         use_outline, outline_mm, outline_color,
                         use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
-                        smoothing=smoothing, gap_fill=gap_fill
+                        smoothing=smoothing_val, gap_fill=gap_fill
                     )
                     bar.progress(65, text="미리보기 생성 중...")
 
@@ -440,7 +462,7 @@ if uploaded_files:
                         img_bgr,
                         use_outline, outline_mm, outline_color,
                         use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
-                        smoothing=smoothing, gap_fill=gap_fill
+                        smoothing=smoothing_val, gap_fill=gap_fill
                     )
                     bar.progress(95, text="마무리 중...")
 
