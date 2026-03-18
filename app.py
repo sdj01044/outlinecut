@@ -68,34 +68,35 @@ def hex_to_eps_rgb(hex_color: str):
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return r/255, g/255, b/255
 
-def extract_contours(gray: np.ndarray):
+def extract_contours(gray: np.ndarray, gap_fill: int = 0):
     """
-    스마트 외곽선 추출:
-    1. 밝은 배경(흰색 등)을 제거해 전경 마스크 생성
-    2. 모폴로지로 라벨/내부 디테일을 메워서 실루엣 하나로 통합
-    3. 전체 면적의 5% 이상인 주요 컨투어만 반환
-       → 병·글자처럼 배경과 분리된 객체의 외곽만 깔끔하게 추출
+    스마트 외곽선 추출.
+    gap_fill=0  : 획 사이를 메우지 않음 → 글자·복잡한 객체에 적합
+    gap_fill>0  : gap_fill px 크기만큼 내부 공간을 메움
+                  → 병처럼 라벨이 있거나 배경이 복잡한 객체에 적합
     """
     h, w = gray.shape
 
-    # ① 밝은 배경 제거 (임계값 240: 흰색/아이보리 배경 대응)
+    # ① 밝은 배경 제거
     _, bg_mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
     fg_mask = cv2.bitwise_not(bg_mask)
 
-    # ② 내부 구멍 메우기 → 라벨·디테일이 뭉쳐서 실루엣 하나가 됨
-    k_close = np.ones((20, 20), np.uint8)
-    fg_filled = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, k_close)
+    # ② gap_fill이 있을 때만 MORPH_CLOSE 적용
+    if gap_fill > 0:
+        k_close = np.ones((gap_fill, gap_fill), np.uint8)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, k_close)
 
     # ③ 작은 노이즈 제거
-    k_open = np.ones((5, 5), np.uint8)
-    binary = cv2.morphologyEx(fg_filled, cv2.MORPH_OPEN, k_open)
+    k_open = np.ones((3, 3), np.uint8)
+    binary = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, k_open)
 
-    # ④ 외부 컨투어만 추출, 면적 5% 이상만 유효
-    cnts, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    min_area = h * w * 0.05
+    # ④ RETR_CCOMP: 외곽 + 구멍(ㅁ 안쪽) 모두 추출
+    cnts, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    if hierarchy is None:
+        return [], binary
+
+    min_area = h * w * 0.001
     result = [c for c in cnts if cv2.contourArea(c) >= min_area]
-
-    # 면적 기준 없어도 최소 가장 큰 것 하나는 반환
     if not result and cnts:
         result = [max(cnts, key=cv2.contourArea)]
 
@@ -165,7 +166,7 @@ def contours_to_eps_paths(contours, img_h, scale_x, scale_y, smoothing=2.0):
 
 def generate_eps(img_bgr, use_outline, outline_mm, outline_color,
                  use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
-                 smoothing=5.0):
+                 smoothing=2.0, gap_fill=0):
     h, w = img_bgr.shape[:2]
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     pts_w = w * 72 / DPI
@@ -173,7 +174,7 @@ def generate_eps(img_bgr, use_outline, outline_mm, outline_color,
     scale_x = pts_w / w
     scale_y = pts_h / h
 
-    contours, binary = extract_contours(gray)
+    contours, binary = extract_contours(gray, gap_fill=gap_fill)
 
     eps_lines = [
         "%!PS-Adobe-3.0 EPSF-3.0",
@@ -224,10 +225,10 @@ def hex_to_bgr(hex_color: str):
 
 def generate_preview_img(img_bgr, use_outline, outline_mm, outline_color,
                          use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
-                         smoothing=5.0):
+                         smoothing=2.0, gap_fill=0):
     """원본 이미지 위에 외곽선/칼선을 직접 그려 RGB numpy 배열로 반환"""
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    contours, binary = extract_contours(gray)
+    contours, binary = extract_contours(gray, gap_fill=gap_fill)
 
     # 원본 이미지를 살짝 밝게 해서 배경으로 사용
     preview = img_bgr.copy()
@@ -296,6 +297,13 @@ smoothing = st.slider(
     min_value=1, max_value=10, value=2, step=1
 )
 
+st.markdown("**내부 채우기**")
+st.caption("글자/세밀한 객체: 0 | 라벨 있는 병·복잡한 배경: 10~20")
+gap_fill = st.slider(
+    "객체 내부 빈 공간을 메우는 강도 (0=끔, 클수록 더 많이 채움)",
+    min_value=0, max_value=30, value=0, step=1
+)
+
 st.divider()
 
 # ── 파일 업로드 ──
@@ -356,7 +364,7 @@ if uploaded_files:
                         img_bgr,
                         use_outline, outline_mm, outline_color,
                         use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
-                        smoothing=smoothing
+                        smoothing=smoothing, gap_fill=gap_fill
                     )
                     bar.progress(65, text="미리보기 생성 중...")
 
@@ -365,7 +373,7 @@ if uploaded_files:
                         img_bgr,
                         use_outline, outline_mm, outline_color,
                         use_cutline, cutline_offset_mm, cutline_width_mm, cutline_color,
-                        smoothing=smoothing
+                        smoothing=smoothing, gap_fill=gap_fill
                     )
                     bar.progress(95, text="마무리 중...")
 
