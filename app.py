@@ -503,16 +503,45 @@ if uploaded_files:
             # ── 2단계: 파일별 탭으로 결과 표시 ──
             if results:
                 st.divider()
+                # 줌 상태 초기화
+                for res in results:
+                    zoom_key = f"zoom_{res['name']}"
+                    if zoom_key not in st.session_state:
+                        st.session_state[zoom_key] = 560
+
                 tabs = st.tabs([r["name"] for r in results])
                 for tab, res in zip(tabs, results):
                     with tab:
                         col1, col2 = st.columns([3, 1])
                         with col1:
+                            zoom_key = f"zoom_{res['name']}"
+                            img_w = res["img_bgr"].shape[1]  # 원본 가로 픽셀
+                            cur_zoom = st.session_state[zoom_key]
+
+                            # 줌 버튼 행
+                            z1, z2, z3 = st.columns([1, 1, 6])
+                            with z1:
+                                if st.button("🔍 +", key=f"zin_{res['name']}",
+                                             disabled=cur_zoom >= img_w):
+                                    st.session_state[zoom_key] = min(img_w, cur_zoom + 120)
+                                    st.rerun()
+                            with z2:
+                                if st.button("🔍 -", key=f"zout_{res['name']}",
+                                             disabled=cur_zoom <= 280):
+                                    st.session_state[zoom_key] = max(280, cur_zoom - 120)
+                                    st.rerun()
+                            with z3:
+                                pct = int(st.session_state[zoom_key] / img_w * 100)
+                                st.caption(f"미리보기 크기: {pct}%  ({st.session_state[zoom_key]}px / 원본 {img_w}px)")
+
                             view_tab1, view_tab2 = st.tabs(["원본", "외곽선 미리보기"])
                             with view_tab1:
-                                st.image(res["img_bgr"][:, :, ::-1], width=560)
+                                st.image(res["img_bgr"][:, :, ::-1],
+                                         width=st.session_state[zoom_key])
                             with view_tab2:
-                                st.image(res["preview_img"], width=560)
+                                st.image(res["preview_img"],
+                                         width=st.session_state[zoom_key])
+
                         with col2:
                             h_px, w_px = res["img_bgr"].shape[:2]
                             st.metric("가로", f"{w_px*25.4/DPI:.1f} mm")
