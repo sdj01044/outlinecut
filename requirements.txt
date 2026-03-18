@@ -2,3 +2,4 @@ streamlit>=1.26.0
 opencv-python-headless
 numpy
 Pillow
+scipy
