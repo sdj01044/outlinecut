@@ -136,53 +136,63 @@ def extract_contours(gray: np.ndarray, gap_fill: int = -1):
         result = [max(cnts, key=cv2.contourArea)]
     return result, fg
 
-def dilate_contours(binary: np.ndarray, offset_mm: float):
+def dilate_contours(binary: np.ndarray, offset_mm: float, gap_fill: int = -1):
     """
-    칼선 추출 (실선):
-    - 외곽 칼선: 글자 바깥으로 offset mm 팽창
-    - 내부 칼선: 'ㅁ' 같은 구멍 경계에서 안쪽으로 offset mm 침식
-                 구멍이 작으면 구멍 크기에 맞게 침식량 자동 조절
+    칼선 추출 (실선) — 외곽선의 내부 채우기 설정과 동일한 기준 적용:
+    gap_fill > 0 : binary가 이미 채워진 상태 → 외곽 칼선만, 내부 칼선 없음
+    gap_fill = 0 : 채우기 없음 → 구멍(ㅁ) 3% 이상인 것에만 내부 칼선 생성
+    gap_fill = -1: 자동 판별 → 구멍 비율 20% 초과 시 내부 칼선 없음
     """
     h, w = binary.shape
     offset_px = mm_to_px(offset_mm)
     k_full = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (offset_px * 2 + 1, offset_px * 2 + 1))
 
-    # ① 외곽 칼선: binary를 바깥으로 팽창
+    # ① 외곽 칼선: 항상 생성
     dilated = cv2.dilate(binary, k_full, iterations=1)
     outer_cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-
-    # ② 내부 칼선: 구멍별로 개별 처리
-    all_cnts, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
-    inner_cut_cnts = []
-    if hierarchy is not None:
-        for i, cnt in enumerate(all_cnts):
-            if hierarchy[0][i][3] == -1:  # parent 없음 = 외곽 → 스킵
-                continue
-            if cv2.contourArea(cnt) < 30:
-                continue
-
-            # 구멍 하나를 마스크에 채움
-            hole_mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.drawContours(hole_mask, [cnt], -1, 255, -1)
-
-            # 구멍 크기 대비 침식량 조절 (짧은 변의 1/3 이내로 제한)
-            _, _, bw, bh = cv2.boundingRect(cnt)
-            max_erode = max(1, min(bw, bh) // 3)
-            actual_px = min(offset_px, max_erode)
-            k_fit = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (actual_px * 2 + 1, actual_px * 2 + 1))
-
-            # 안쪽으로 침식 → 구멍 경계에서 offset mm 안쪽 라인
-            eroded = cv2.erode(hole_mask, k_fit, iterations=1)
-            found, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            valid = [c for c in found if cv2.contourArea(c) > 10]
-
-            if valid:
-                inner_cut_cnts.extend(valid)
-            else:
-                # 침식 후 아무것도 없으면 원본 구멍 경계를 칼선으로 사용
-                inner_cut_cnts.append(cnt)
-
     result = [c for c in outer_cnts if cv2.contourArea(c) > 50]
+
+    # ② gap_fill > 0이면 내부 칼선 없음
+    if gap_fill > 0:
+        return result
+
+    # ③ 구멍 분석
+    all_cnts, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    if hierarchy is None:
+        return result
+
+    outer_areas = [cv2.contourArea(all_cnts[i]) for i in range(len(all_cnts)) if hierarchy[0][i][3] == -1]
+    hole_areas  = [cv2.contourArea(all_cnts[i]) for i in range(len(all_cnts)) if hierarchy[0][i][3] != -1]
+    max_outer = max(outer_areas) if outer_areas else 1
+    max_hole  = max(hole_areas)  if hole_areas  else 0
+
+    # gap_fill=-1(자동): 구멍 비율 20% 초과면 흰 몸통 객체 → 내부 칼선 없음
+    if gap_fill == -1 and (max_hole / max_outer) > 0.20:
+        return result
+
+    # ④ 내부 칼선: 구멍 면적이 최대 외곽의 3% 이상인 것만
+    HOLE_MIN_RATIO = 0.03
+    inner_cut_cnts = []
+    for i, cnt in enumerate(all_cnts):
+        if hierarchy[0][i][3] == -1:
+            continue
+        area = cv2.contourArea(cnt)
+        if area / max_outer < HOLE_MIN_RATIO:
+            continue
+        hole_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(hole_mask, [cnt], -1, 255, -1)
+        _, _, bw, bh = cv2.boundingRect(cnt)
+        max_erode = max(1, min(bw, bh) // 3)
+        actual_px = min(offset_px, max_erode)
+        k_fit = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (actual_px * 2 + 1, actual_px * 2 + 1))
+        eroded = cv2.erode(hole_mask, k_fit, iterations=1)
+        found, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        valid = [c for c in found if cv2.contourArea(c) > 10]
+        if valid:
+            inner_cut_cnts.extend(valid)
+        else:
+            inner_cut_cnts.append(cnt)
+
     result.extend(inner_cut_cnts)
     return result
 
@@ -235,7 +245,7 @@ def generate_eps(img_bgr, use_outline, outline_mm, outline_color,
     if use_cutline and contours:
         r, g, b = hex_to_eps_rgb(cutline_color)
         stroke_pt = cutline_width_mm * 72 / 25.4
-        cut_contours = dilate_contours(binary, cutline_offset_mm)
+        cut_contours = dilate_contours(binary, cutline_offset_mm, gap_fill=gap_fill)
         if cut_contours:
             paths = contours_to_eps_paths(cut_contours, h, scale_x, scale_y, smoothing)
             eps_lines += [
@@ -278,7 +288,7 @@ def generate_preview_img(img_bgr, use_outline, outline_mm, outline_color,
             cv2.polylines(preview, [pts], True, color, thickness, cv2.LINE_AA)
 
     if use_cutline and contours:
-        cut_contours = dilate_contours(binary, cutline_offset_mm)
+        cut_contours = dilate_contours(binary, cutline_offset_mm, gap_fill=gap_fill)
         color = hex_to_bgr(cutline_color)
         thickness = max(1, mm_to_px(cutline_width_mm))
         for cnt in cut_contours:
