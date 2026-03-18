@@ -66,30 +66,47 @@ def dilate_contours(binary: np.ndarray, offset_mm: float):
     """
     칼선 추출 (실선):
     - 외곽 칼선: 글자 바깥으로 offset mm 팽창
-    - 내부 칼선: 'ㅁ' 같은 구멍을 hole_mask로 분리 → 구멍 방향으로 offset mm 팽창
+    - 내부 칼선: 'ㅁ' 같은 구멍 경계에서 안쪽으로 offset mm 침식
+                 구멍이 작으면 구멍 크기에 맞게 침식량 자동 조절
     """
     h, w = binary.shape
     offset_px = mm_to_px(offset_mm)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (offset_px * 2 + 1, offset_px * 2 + 1))
+    k_full = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (offset_px * 2 + 1, offset_px * 2 + 1))
 
-    # ① 외곽 칼선: binary 팽창 후 외부 컨투어만
-    dilated = cv2.dilate(binary, k, iterations=1)
+    # ① 외곽 칼선: binary를 바깥으로 팽창
+    dilated = cv2.dilate(binary, k_full, iterations=1)
     outer_cnts, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
-    # ② 내부 칼선: 구멍 컨투어를 마스크에 채운 뒤 팽창
+    # ② 내부 칼선: 구멍별로 개별 처리
     all_cnts, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
-    hole_mask = np.zeros((h, w), dtype=np.uint8)
+    inner_cut_cnts = []
     if hierarchy is not None:
         for i, cnt in enumerate(all_cnts):
-            # parent != -1 이면 구멍(hole) 컨투어
-            if hierarchy[0][i][3] != -1 and cv2.contourArea(cnt) > 30:
-                cv2.drawContours(hole_mask, [cnt], -1, 255, -1)
+            if hierarchy[0][i][3] == -1:  # parent 없음 = 외곽 → 스킵
+                continue
+            if cv2.contourArea(cnt) < 30:
+                continue
 
-    inner_cut_cnts = []
-    if hole_mask.any():
-        dilated_holes = cv2.dilate(hole_mask, k, iterations=1)
-        found, _ = cv2.findContours(dilated_holes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        inner_cut_cnts = [c for c in found if cv2.contourArea(c) > 30]
+            # 구멍 하나를 마스크에 채움
+            hole_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.drawContours(hole_mask, [cnt], -1, 255, -1)
+
+            # 구멍 크기 대비 침식량 조절 (짧은 변의 1/3 이내로 제한)
+            _, _, bw, bh = cv2.boundingRect(cnt)
+            max_erode = max(1, min(bw, bh) // 3)
+            actual_px = min(offset_px, max_erode)
+            k_fit = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (actual_px * 2 + 1, actual_px * 2 + 1))
+
+            # 안쪽으로 침식 → 구멍 경계에서 offset mm 안쪽 라인
+            eroded = cv2.erode(hole_mask, k_fit, iterations=1)
+            found, _ = cv2.findContours(eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            valid = [c for c in found if cv2.contourArea(c) > 10]
+
+            if valid:
+                inner_cut_cnts.extend(valid)
+            else:
+                # 침식 후 아무것도 없으면 원본 구멍 경계를 칼선으로 사용
+                inner_cut_cnts.append(cnt)
 
     result = [c for c in outer_cnts if cv2.contourArea(c) > 50]
     result.extend(inner_cut_cnts)
