@@ -222,7 +222,7 @@ with st.sidebar:
     st.header("⚙️ 설정")
     st.divider()
 
-    use_outline = st.toggle("🖊 외곽선 사용", value=True)
+    use_outline = st.checkbox("🖊 외곽선 사용", value=True)
     if use_outline:
         outline_mm    = st.number_input("외곽선 두께 (mm)", 0.1, 10.0, 0.5, 0.1)
         outline_color = st.color_picker("외곽선 색상", "#0078D4")
@@ -231,7 +231,7 @@ with st.sidebar:
 
     st.divider()
 
-    use_cutline = st.toggle("✂️ 칼선 사용", value=True)
+    use_cutline = st.checkbox("✂️ 칼선 사용", value=True)
     if use_cutline:
         cutline_offset_mm = st.number_input("칼선 간격 (mm)", 0.1, 30.0, 3.0, 0.5)
         cutline_width_mm  = st.number_input("칼선 두께 (mm)", 0.1, 5.0, 0.3, 0.1)
@@ -262,7 +262,8 @@ if uploaded_files:
             bar = st.progress(0, text="이미지 로딩 중...")
 
             try:
-                # 이미지 로드
+                # 이미지 로드 (파일 포인터를 처음으로 되돌린 후 읽기)
+                file.seek(0)
                 raw = np.frombuffer(file.read(), np.uint8)
                 img_bgr = cv2.imdecode(raw, cv2.IMREAD_COLOR)
                 if img_bgr is None:
