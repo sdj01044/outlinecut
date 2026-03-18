@@ -220,11 +220,13 @@ st.caption("이미지를 업로드하면 외곽선과 칼선을 자동 추출하
 # 파일 크기 제한 (MB)
 MAX_FILE_MB = 10
 
-# ── 사이드바 ──
-with st.sidebar:
-    st.header("설정")
-    st.divider()
+# ── 설정 (제목 아래) ──
+st.subheader("설정")
 
+col_outline, col_cutline = st.columns(2)
+
+with col_outline:
+    st.markdown("**외곽선**")
     use_outline = st.checkbox("외곽선 사용", value=True)
     if use_outline:
         outline_mm    = st.number_input("외곽선 두께 (mm)", 0.1, 10.0, 0.5, 0.1)
@@ -232,8 +234,8 @@ with st.sidebar:
     else:
         outline_mm, outline_color = 0.5, "#0078D4"
 
-    st.divider()
-
+with col_cutline:
+    st.markdown("**칼선**")
     use_cutline = st.checkbox("칼선 사용", value=True)
     if use_cutline:
         cutline_offset_mm = st.number_input("칼선 간격 (mm)", 0.1, 30.0, 3.0, 0.5)
@@ -242,13 +244,12 @@ with st.sidebar:
     else:
         cutline_offset_mm, cutline_width_mm, cutline_color = 3.0, 0.3, "#FF0000"
 
-    if not use_outline and not use_cutline:
-        st.warning("외곽선 또는 칼선을 하나는 활성화해주세요.")
+if not use_outline and not use_cutline:
+    st.warning("외곽선 또는 칼선을 하나는 활성화해주세요.")
 
-    st.divider()
-    st.caption(f"파일 1개당 최대 {MAX_FILE_MB}MB")
+st.divider()
 
-# ── 메인 ──
+# ── 파일 업로드 ──
 uploaded_files = st.file_uploader(
     "이미지 업로드 (여러 개 선택 가능)",
     type=["png", "jpg", "jpeg", "bmp", "tiff"],
