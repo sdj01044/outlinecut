@@ -17,7 +17,7 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stApp { background-color: #f8f9fa; }
-    .block-container { padding-top: 2rem; }
+    .block-container { padding: 5rem 2rem 2rem; }
     h1 { color: #1a1a2e; font-size: 1.8rem; }
     .stDownloadButton > button {
         background-color: #0078D4;
